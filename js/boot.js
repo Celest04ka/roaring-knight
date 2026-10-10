@@ -1,0 +1,439 @@
+﻿// Boot: load extracted Deltarune ch3 data, build the translated GML, start the game at the Roaring Knight fight.
+'use strict';
+
+(function () {
+  const JF = window.JF = {
+    paths: { meta: '_extract/meta/', assets: 'assets/' },
+    running: false, paused: false, error: null,
+    opts: { practice: null, invincible: false, mantle: false }
+  };
+  const D = GM.draw;
+  // music streams the battle and game over screens ask for (snd_init), plus the menu song
+  JF.MUSIC = ['knight.ogg', 'AUDIO_DEFEAT.ogg', 'AUDIO_DRONE.ogg', 'AUDIO_DARKNESS.ogg', 'knight_appears.ogg', 'wind_highplace.ogg'];
+
+  // ------------------------------------------------------------ asset access
+  // three sources: website pack (data/game.json + data/audio.bin + data/tex/*.png, see tools/build_site.js),
+  // file:// bundles (window.JF_BUNDLE, tools/build_bundle.js), or the raw extraction (_extract/, dev only)
+  let PACK = null;
+  function urlFor(kind, name) {
+    if (kind === 'meta') return JF.paths.meta + name;
+    if (kind === 'tex') return JF.paths.meta + 'tex/' + name;
+    if (kind === 'snd') return JF.paths.meta + 'snd/' + name;
+    return JF.paths.assets + name;
+  }
+  async function fetchOk(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('fetch ' + url + ' ' + r.status);
+    return r;
+  }
+  async function getJSON(kind, name) {
+    const key = kind + '/' + name;
+    if (PACK && PACK.json[key] !== undefined) return PACK.json[key];
+    if (window.JF_BUNDLE && JF_BUNDLE.json[key]) return JF_BUNDLE.json[key];
+    return (await fetchOk(urlFor(kind, name))).json();
+  }
+  async function getText(kind, name) {
+    const key = kind + '/' + name;
+    if (PACK && PACK.json[key] !== undefined) return PACK.json[key];
+    if (window.JF_BUNDLE && JF_BUNDLE.text[key]) return JF_BUNDLE.text[key];
+    return (await fetchOk(urlFor(kind, name))).text();
+  }
+  function b64ToBuf(b64) { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u.buffer; }
+  async function getBinary(kind, name) {
+    const key = kind + '/' + name;
+    if (PACK && PACK.audioIndex[key]) { const [off, len] = PACK.audioIndex[key]; return PACK.audio.slice(off, off + len); }
+    if (window.JF_BUNDLE && JF_BUNDLE.bin[key]) return b64ToBuf(JF_BUNDLE.bin[key]);
+    return (await fetchOk(urlFor(kind, name))).arrayBuffer();
+  }
+  function getImage(name) {
+    return new Promise((res, rej) => {
+      const img = new Image();
+      img.onload = () => res(img);
+      img.onerror = () => rej(new Error('image ' + name));
+      if (PACK) img.src = 'data/tex/' + name;
+      else if (window.JF_BUNDLE && JF_BUNDLE.bin['tex/' + name]) img.src = 'data:image/png;base64,' + JF_BUNDLE.bin['tex/' + name];
+      else img.src = urlFor('tex', name);
+    });
+  }
+  // texture page for the website pack: fetched as a blob (with retries) and decoded to an ImageBitmap,
+  // which is closed right after the GPU upload to keep memory low on phones
+  function blobToImage(blob) {
+    return new Promise((res, rej) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); res(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('the browser could not decode the image')); };
+      img.src = url;
+    });
+  }
+  async function loadPackTexture(name) {
+    let last = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await fetch('data/tex/' + name, { cache: attempt ? 'reload' : 'default' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const blob = await r.blob();
+        if (window.createImageBitmap) {
+          try { return await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }); } catch (e) { /* fall back to <img> */ }
+        }
+        return await blobToImage(blob);
+      } catch (e) { last = e; }
+    }
+    throw new Error('texture ' + name + ' (' + (last && last.message ? last.message : last) + ')');
+  }
+
+  async function tryLoadPack(progress) {
+    let r;
+    try { r = await fetch('data/game.json'); } catch (e) { return false; }
+    if (!r.ok) return false;
+    progress && progress('data');
+    const json = await r.json();
+    progress && progress('audio');
+    const audio = await (await fetchOk('data/audio.bin')).arrayBuffer();
+    PACK = { json, audio, audioIndex: json.__audio };
+    return true;
+  }
+  // GM file names used by audio streams ("mus/joker.ogg") and sounds ("ext:snd_x.ogg")
+  GM.audio.loader = async function (file) {
+    file = String(file).replace(/\\/g, '/');
+    if (file.startsWith('snd:')) return getBinary('snd', file.slice(4));
+    if (file.startsWith('ext:')) return getBinary('assets', 'ext/' + file.slice(4));
+    return getBinary('assets', file.replace(/^.*?mus\//, 'mus/'));
+  };
+
+  // ------------------------------------------------------------ loading
+  JF.load = async function (progress) {
+    const say = (t) => progress && progress(t);
+    say('data');
+    const [sprites, objects, fonts, sounds, backgrounds, roomsList, rooms, general, scripts] = await Promise.all(
+      ['sprites', 'objects', 'fonts', 'sounds', 'backgrounds', 'rooms_list', 'rooms', 'general', 'scripts'].map(n => getJSON('meta', n + '.json')));
+    // asset index exactly like the translator (tools/gml2js.js buildAssets)
+    const ai = GM.assetIndex;
+    const add = (list, kind) => list.forEach((x, i) => { const nm = typeof x === 'string' ? x : x && x.name; if (nm) ai.set(nm, { kind, i }); });
+    add(sprites, 'sprite'); add(sounds, 'sound'); add(backgrounds, 'background'); add(fonts, 'font'); add(roomsList, 'room'); add(objects, 'object');
+    scripts.forEach((s, i) => { if (s && s.name && !ai.has(s.name)) ai.set(s.name, { kind: 'script', i }); });
+    GM.scripts = scripts;
+    GM.scriptByIndex = (i) => scripts[i] && GM.S[scripts[i].name];
+    // sprites + collision masks
+    GM.sprites = sprites.map(s => {
+      if (!s) return null;
+      const sp = Object.assign({}, s);
+      sp.frames = s.frames.filter(Boolean);
+      if (s.masks && s.masks.length && s.masks[0]) {
+        sp.maskData = s.masks.map(m => m ? new Uint8Array(b64ToBuf(m)) : null);
+        sp.mstride = (s.mw + 7) >> 3;
+        // masks are either full-size or cropped to the bbox
+        if (s.mw === s.w && s.mh === s.h) { sp.maskOx = 0; sp.maskOy = 0; } else { sp.maskOx = s.ml; sp.maskOy = s.mt; }
+      }
+      delete sp.masks;
+      return sp;
+    });
+    GM.backgrounds = backgrounds;
+    GM.roomNames = roomsList;
+    GM.rooms = rooms;
+    GM.roomOrder = general.roomOrder.map(n => ai.get(n) ? ai.get(n).i : -1).filter(i => i >= 0);
+    GM.general = general;
+    GM.sounds = sounds.map(s => s ? { name: s.name, file: s.file, volume: s.volume === undefined ? 1 : s.volume, pitch: s.pitch || 1, group: s.group, buffer: null } : null);
+    D.setupFonts(fonts);
+    // textures
+    say('textures');
+    const pages = Math.max(...sprites.filter(Boolean).flatMap(s => s.frames.filter(Boolean).map(f => f.p)), ...fonts.filter(Boolean).map(f => f.tex ? f.tex.p : 0)) + 1;
+    for (let i = 0; i < pages; i++) {
+      say(`textures ${i + 1}/${pages}`);
+      const img = PACK ? await loadPackTexture(i + '.png') : await getImage(i + '.png');
+      D.addPage(i, img);
+      if (img.close) img.close();
+    }
+    // language file into the virtual file system
+    GM.vfs.set('lang/lang_en.json', await getText('assets', 'lang/lang_en.json'));
+    // sounds
+    say('sounds');
+    GM.audio.init();
+    const entries = [];
+    GM.sounds.forEach((s, i) => {
+      if (!s || !s.file) return;
+      entries.push({ index: i, url: s.file.startsWith('ext:') ? s.file : 'snd:' + s.file });
+    });
+    // dev: ?nosound skips decoding the sound effects and music (faster reloads while testing)
+    if (!/[?&]nosound/.test(location.search)) {
+      await GM.audio.loadSounds(entries, (d, n) => say(`sounds ${d}/${n}`));
+      // only the fight music is preloaded; the game-over songs load on first use (audio_create_stream), saving memory on phones
+      await Promise.all(JF.MUSIC.slice(0, 1).map(f => GM.audio.preloadStream('mus/' + f).catch(e => console.warn(e))));
+    }
+    // translated GML
+    say('code');
+    JF.objectsMeta = objects;
+    buildGML();
+    say('ready');
+  };
+
+  function buildGML() {
+    GM.S = {}; GM.C = {}; GM.I = {};
+    const rt = Object.assign({}, GM.rt, { G: GM.globals, R: GM.R, F: GM.F, S: GM.S, C: GM.C, I: GM.I });
+    GML_BUILD(rt);
+    nativeOverrides();
+    practicePatches();
+    GM.setupObjects(JF.objectsMeta, GM.C);
+  }
+
+  // ------------------------------------------------------------ practice mode (our addition, not part of Deltarune)
+  // The Knight picks its turn in obj_knight_enemy User Event 0 (myattackchoice + difficulty); practice replaces the pick.
+  // The list is the fight's own turn script (obj_knight_enemy Other_10), in order.
+  JF.ATTACKS = [
+    [1, 0, 'Stars'], [11, 0, 'Homing Swords'], [2, 0, 'Flurry'], [13, 0, 'Sword Tunnel'], [5, 0, 'Spin Slash'],
+    [12, 0, 'Diagonal Shots'], [16, 0, 'Slash + Swords'], [17, 0, 'Homing Swords II'], [7, 0, 'Combination'],
+    [1, 1, 'Stars II'], [2, 1, 'Flurry II'], [13, 3, 'Sword Tunnel II'], [15, 0, 'Sword Vortex'], [5, 1, 'Spin Slash II'],
+    [1, 2, 'Stars III'], [2, 3, 'Flurry III'], [14, 0, 'Homing Swords III'], [13, 4, 'Sword Tunnel III'], [5, 2, 'Spin Slash III'],
+    [-1, 1, 'Charge Up'], [9, 0, 'Roaring']
+  ];
+  function practicePatches() {
+    // God Mode: chapter 3 has no debug god mode, so the damage scripts are skipped (like invulnerability frames)
+    for (const n of ['scr_damage', 'scr_damage_all', 'scr_damage_maxhp', 'scr_damage_fixed']) {
+      const f = GM.S[n];
+      if (f) GM.S[n] = function (self, other, ...a) { if (JF.opts.invincible) return 0; return f(self, other, ...a); };
+    }
+    const name = 'gml_Object_obj_knight_enemy_Other_10';
+    const orig = GM.C[name];
+    if (!orig) return;
+    GM.C[name] = function (self, other) {
+      orig(self, other);
+      if (JF.opts.practice != null) {
+        const a = JF.ATTACKS[JF.opts.practice];
+        self.myattackchoice = a[0];
+        self.difficulty = a[1];
+        JF.practiceCount = (JF.practiceCount || 0) + 1;
+      }
+    };
+  }
+
+  // drives the hero menu in practice mode: everyone DEFENDs, HP is restored at the start of each player turn
+  JF.practiceTick = function () {
+    const G = GM.globals;
+    if (JF.opts.practice == null || !GM.instanceExists(GM.assetIndex.get('obj_battlecontroller').i)) return;
+    if (G.mnfight !== 0 || G.myfight !== 0) { JF.practiceHealed = false; return; }
+    if (!JF.practiceHealed) {
+      for (let i = 0; i < 3; i++) {
+        const c = G.char[i];
+        if (c > 0) G.hp[c] = G.maxhp[c];
+      }
+      for (let i = 0; i < 3; i++) if (G.char[i] > 0) GM.S.scr_revive(GM.globalSelf, GM.globalSelf, i);
+      JF.practiceHealed = true;
+    }
+    if (G.bmenuno !== 0) return;
+    const turn = G.charturn;
+    if (turn < 0 || turn > 2) return;
+    if (G.bmenucoord && G.bmenucoord[0]) G.bmenucoord[0][turn] = 4; // DEFEND button
+    if ((GM.frame % 4) === 0) GM.input.keyDown(90); else if ((GM.frame % 4) === 2) GM.input.keyUp(90);
+  };
+
+  // faster native versions of a few compatibility scripts (same behaviour)
+  function nativeOverrides() {
+    const S = GM.S, F = GM.F;
+    const viewProp = (prop, idx) => {
+      const v = GM.views[idx] || GM.views[0];
+      switch (prop) {
+        case 0: return v.cam.x; case 1: return v.cam.y; case 2: return v.cam.w; case 3: return v.cam.h; case 4: return v.cam.angle;
+        case 5: return v.cam.bx; case 6: return v.cam.by; case 7: return v.cam.sx; case 8: return v.cam.sy; case 9: return v.cam.target;
+        case 10: return +v.visible; case 11: return v.px; case 12: return v.py; case 13: return v.pw; case 14: return v.ph; case 15: return idx; case 16: return -1;
+      }
+      return -1;
+    };
+    S.__view_get = (self, other, prop, idx) => viewProp(prop, idx);
+    // retry after a game over: the real game reloads the temp save; we restart the fight (tempflag[4] keeps the short intro)
+    S.scr_tempload = () => { JF.pending = 'retry'; };
+    S.ossafe_game_end = () => { JF.pending = 'menu'; };
+    // the game counts Knight attempts in its save files; with none, a lost fight just moves the story on.
+    // Here the player has always "fought before", so losing shows the Knight's game over: FIGHT AGAIN / MOVE ON.
+    S.scr_get_knight_total_attempts = () => 1;
+    const origSet = S.__view_set;
+    S.__view_set = (self, other, prop, idx, val) => {
+      const v = GM.views[idx] || GM.views[0];
+      switch (prop) {
+        case 0: v.cam.x = val; return; case 1: v.cam.y = val; return; case 2: v.cam.w = val; return; case 3: v.cam.h = val; return;
+        case 9: v.cam.target = val; return; case 10: v.visible = RT_t(val); return;
+      }
+      if (origSet) origSet(self, other, prop, idx, val);
+    };
+  }
+  const RT_t = (v) => GM.rt.$t(v);
+
+  // ------------------------------------------------------------ game state for the fight (end of chapter 3, Knight retry)
+  // weapons: Saber10 / ToxicAxe / FlexScarf; armor ids from scr_armorinfo; 23 = ShadowMantle
+  JF.KNIGHT_GEAR = { weapon: [0, 23, 24, 25], armor1: [0, 22, 11, 9], armor2: [0, 14, 13, 12] };
+  // food: ReviveMint x2, ExecBuffet, DeluxeDinner, LightCandy x2, TVDinner x2, ButJuice, CD Bagel, DD-Burger, TensionBit
+  JF.KNIGHT_ITEMS = [2, 2, 38, 39, 23, 23, 34, 34, 24, 16, 22, 27];
+  function applyKnightSave(self) {
+    const G = GM.globals, S = GM.S;
+    // what DEVICE_FAILURE does when the player retries the Knight fight (knight_mode_con 53)
+    G.darkzone = 1;
+    G.plot = 320;
+    G.interact = 0;
+    G.tempflag[90] = 4;
+    G.knight_battle_losses = 2; // the game's short retry intro (obj_ch3_PTB02 con 3.1); does not change difficulty
+    S.scr_losechar(self, self);
+    G.char[0] = 1;
+    if (!S.scr_havechar(self, self, 2)) S.scr_getchar(self, self, 2);
+    if (!S.scr_havechar(self, self, 3)) S.scr_getchar(self, self, 3);
+    G.charauto[0] = 0; G.charauto[1] = 0; G.charauto[2] = 0; G.charauto[3] = 0;
+    G.truename = 'KRIS';
+    const gear = JF.KNIGHT_GEAR;
+    for (let i = 1; i <= 3; i++) { G.charweapon[i] = gear.weapon[i]; G.chararmor1[i] = gear.armor1[i]; G.chararmor2[i] = gear.armor2[i]; }
+    if (JF.opts.mantle) G.chararmor1[1] = 23; // ShadowMantle on Kris: scr_damage cuts the Knight's damage to 33%
+    S.scr_weaponinfo_mine(self, self);
+    S.scr_armorinfo_mine(self, self);
+    for (let i = 0; i < 13; i++) G.item[i] = JF.KNIGHT_ITEMS[i] || 0;
+    S.scr_iteminfo_all(self, self);
+    for (let i = 0; i < 4; i++) G.hp[i] = G.maxhp[i];
+    G.flag[16] = 1; // music volume
+    G.facing = 1;
+    G.entrance = 0;
+    if (JF.opts.invincible) G.chemg_god_mode = 1; // Deltarune's own debug god mode (checked in scr_damage)
+    JF.saveApplied = true;
+    JF.onSaveApplied && JF.onSaveApplied(G);
+  }
+
+  // ------------------------------------------------------------ start / restart
+  JF.start = function () {
+    JF.error = null;
+    GM.audio.stopAll();
+    // fresh runtime state
+    for (const k of Object.keys(GM.globals)) delete GM.globals[k];
+    GM.instances.length = 0; GM.byId.clear(); GM.lastId = 300000; GM.room = -1; GM.newRoom = -1; GM.started = false;
+    GM.dsMaps.length = 0; GM.dsLists.length = 0;
+    D.fontsRt.length = 0; D.setupFonts(JF.fontsMeta || []);
+    D.font = -1; D.color = 0xFFFFFF; D.alpha = 1; D.halign = 0; D.valign = 0;
+    GM.input.clear();
+    GM.globalSelf = new GM.Instance(-5, { index: -1, sprite: -1, mask: -1, depth: 0, visible: false, solid: false, persistent: false, ev: new Map(), col: [], ancSet: new Set(), descSet: new Set() });
+    // global script top-level code (GMS 2.3 runs it before the first room)
+    for (const name of GM.general.globalInit) { const f = GM.I[name]; if (f) f(GM.globalSelf, GM.globalSelf); }
+    // the first room change out of ROOM_INITIALIZE goes to the Knight fight instead of the title screens
+    JF.saveApplied = false;
+    JF.result = null;
+    const snow = GM.assetIndex.get('room_dw_snow_zone').i;
+    GM.roomRedirect = function (target) {
+      const name = GM.roomNames[target];
+      if (!JF.saveApplied) { applyKnightSave(GM.globalSelf); return snow; }
+      if (name === 'room_gameover' || name === 'PLACE_FAILURE') return target;
+      // retry from the game over screen (DEVICE_FAILURE, tempflag[90] = 4) goes back to the snow zone as in the game
+      if (target === snow && GM.globals.tempflag && GM.globals.tempflag[90] === 4) {
+        if (JF.opts.invincible) GM.globals.chemg_god_mode = 1;
+        return target;
+      }
+      // anything else (giving up, the story moving on) ends the fight
+      JF.result = JF.result || 'lost';
+      JF.onFightOver && JF.onFightOver(JF.result);
+      return -1;
+    };
+    GM.beforeStep = JF.practiceTick;
+    JF.practiceCount = 0;
+    GM.gotoRoomNow(GM.assetIndex.get('ROOM_INITIALIZE').i);
+    JF.running = true;
+  };
+
+  // room_goto goes through the redirect hook
+  const origGoto = GM.F.room_goto;
+  GM.checkRoomOrig = GM.checkRoom;
+  GM.checkRoom = function () {
+    if (GM.newRoom !== -1 && GM.roomRedirect) {
+      const r = GM.roomRedirect(GM.newRoom);
+      if (r === -1) { GM.newRoom = -1; JF.running = false; return true; }
+      GM.newRoom = r;
+    }
+    return GM.checkRoomOrig();
+  };
+
+  // ------------------------------------------------------------ main loop
+  GM.onGameEnd = () => { JF.pending = 'menu'; };
+  // one game step plus handling of requests made by the game code during it
+  JF.tick = function () {
+    GM.step();
+    // the fight is over when obj_ch3_PTB02 has evaluated the result (con 8 -> 9 or 49).
+    // teamdefeated stays true when the party fell; obj_knight_enemy clears it when the Knight retreats (end cutscene).
+    if (JF.running && !JF.result) {
+      const ev = GM.instances.find(i => !i.$dead && i.$obj.name === 'obj_ch3_PTB02');
+      if (ev && (ev.con === 9 || ev.con === 49)) {
+        JF.result = RT_t(ev.teamdefeated) ? 'lost' : 'won';
+        JF.endTimer = 45;
+      }
+    }
+    if (JF.endTimer > 0 && --JF.endTimer === 0) { JF.running = false; JF.onFightOver && JF.onFightOver(JF.result); }
+    if (JF.pending) {
+      const p = JF.pending;
+      JF.pending = null;
+      if (p === 'retry') { JF.retryQuick = true; JF.start(); }
+      else if (p === 'menu') { JF.running = false; GM.audio.stopAll(); JF.onQuit && JF.onQuit(); }
+    }
+  };
+  let acc = 0, last = 0;
+  const STEP = 1000 / 30;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (!last) last = now;
+    acc += now - last;
+    last = now;
+    if (!JF.running || JF.paused) {
+      acc = 0;
+      if (!JF.running && JF.menuFrame) { try { JF.menuFrame(now); } catch (e) { console.error(e); JF.menuFrame = null; } }
+      return;
+    }
+    let n = 0;
+    while (acc >= STEP && n < 3) {
+      try { JF.tick(); } catch (e) { JF.fail(e); return; }
+      acc -= STEP; n++;
+    }
+    if (acc > STEP * 3) acc = 0;
+  }
+  JF.fail = function (e) {
+    JF.running = false;
+    JF.error = e;
+    console.error('[KnightFight] runtime error', e);
+    JF.onError && JF.onError(e);
+  };
+  JF.stepN = function (n) { for (let i = 0; i < n; i++) JF.tick(); };
+
+  // ------------------------------------------------------------ input
+  const blockKeys = new Set([37, 38, 39, 40, 32, 13, 16, 17, 9, 112, 113, 114, 116, 117, 118, 119, 120, 121, 122, 123]);
+  window.addEventListener('keydown', (e) => {
+    if (e.keyCode === 115 || (e.keyCode === 13 && e.altKey)) { // F4 / Alt+Enter: fullscreen
+      e.preventDefault();
+      if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => 0);
+      return;
+    }
+    if (JF.keyFilter && JF.keyFilter(e)) return;
+    if (blockKeys.has(e.keyCode) || (e.keyCode >= 65 && e.keyCode <= 90 && !e.ctrlKey)) e.preventDefault();
+    GM.input.keyDown(e.keyCode);
+    GM.audio.resume();
+  });
+  window.addEventListener('keyup', (e) => { GM.input.keyUp(e.keyCode); });
+  window.addEventListener('blur', () => GM.input.clear());
+
+  // opened by double click (file://): fetch() is not allowed, so load the packed resources as scripts
+  function loadScript(src) {
+    return new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = res;
+      s.onerror = () => rej(new Error('missing ' + src + ' (build it: node tools/build_bundle.js)'));
+      document.head.appendChild(s);
+    });
+  }
+
+  JF.init = async function (canvas, progress) {
+    D.init(canvas);
+    D.resize();
+    window.addEventListener('resize', D.resize);
+    if (location.protocol === 'file:' || /[?&]bundle/.test(location.search)) {
+      progress && progress('resource packs');
+      try {
+        for (const n of ['meta', 'tex', 'snd']) await loadScript('data/bundle_' + n + '.js');
+      } catch (e) {
+        throw new Error('this copy has to be opened through a web server (for example the GitHub Pages site), not as a local file');
+      }
+    } else {
+      await tryLoadPack(progress);
+    }
+    await JF.load(progress);
+    JF.fontsMeta = await getJSON('meta', 'fonts.json');
+    requestAnimationFrame(frame);
+  };
+})();
