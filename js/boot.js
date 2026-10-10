@@ -128,6 +128,9 @@
       delete sp.masks;
       return sp;
     });
+    // nine-slice sprites (GMS 2.3; tools/read_nineslice.js): borders keep their size when the sprite is scaled
+    const nine = await getJSON('meta', 'nineslice.json').catch(() => ({}));
+    for (const sp of GM.sprites) if (sp && nine[sp.name]) sp.nine = nine[sp.name];
     GM.backgrounds = backgrounds;
     GM.roomNames = roomsList;
     GM.rooms = rooms;
@@ -269,7 +272,10 @@
     G.plot = 320;
     G.interact = 0;
     G.tempflag[90] = 4;
-    G.knight_battle_losses = 2; // the game's short retry intro (obj_ch3_PTB02 con 3.1); does not change difficulty
+    // 1 = the intro with the Knight's roar (obj_ch3_PTB02 con 3 -> obj_knight_roaring_fx); after a loss DEVICE_FAILURE
+    // raises it to 2+, so FIGHT AGAIN gets the game's short retry intro. Practice always starts short.
+    // It does not change the difficulty.
+    G.knight_battle_losses = JF.opts.practice != null ? 2 : 1;
     S.scr_losechar(self, self);
     G.char[0] = 1;
     if (!S.scr_havechar(self, self, 2)) S.scr_getchar(self, self, 2);

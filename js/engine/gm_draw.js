@@ -217,8 +217,37 @@
     if (!s) return;
     const fr = frameOf(s, sub);
     if (!fr) return;
+    if (s.nine && (xs !== 1 || ys !== 1)) { drawNine(s, fr, x, y, xs, ys, rot, col, alpha); return; }
     drawRegion(fr, fr.sx, fr.sy, fr.sw, fr.sh, fr.tx - s.ox, fr.ty - s.oy, fr.tw, fr.th, x, y, xs, ys, rot, col, alpha);
   };
+
+  // nine-slice: corners keep their size, edges and centre stretch (repeat/mirror tile modes are drawn stretched,
+  // blank/hide are skipped). Slices are cut in sprite space and clipped to the frame's trimmed texture area.
+  function drawNine(s, fr, x, y, xs, ys, rot, col, alpha) {
+    const n = s.nine, W = s.w * Math.abs(xs), H = s.h * Math.abs(ys);
+    let l = n.l, r = n.r, t = n.t, b = n.b;
+    if (l + r > W) { const k = W / (l + r); l *= k; r *= k; }
+    if (t + b > H) { const k = H / (t + b); t *= k; b *= k; }
+    const sxs = [0, n.l, s.w - n.r, s.w], dxs = [0, l, W - r, W];
+    const sys = [0, n.t, s.h - n.b, s.h], dys = [0, t, H - b, H];
+    const ox = s.ox * Math.abs(xs), oy = s.oy * Math.abs(ys);
+    const kx = fr.sw / fr.tw, ky = fr.sh / fr.th;
+    for (let cy = 0; cy < 3; cy++) {
+      for (let cx = 0; cx < 3; cx++) {
+        // tile modes: left, top, right, bottom, centre
+        const mode = cx === 1 && cy === 1 ? n.modes[4] : cy === 1 ? n.modes[cx === 0 ? 0 : 2] : cx === 1 ? n.modes[cy === 0 ? 1 : 3] : 0;
+        if (mode >= 3) continue;
+        const a0 = sxs[cx], a1 = sxs[cx + 1], b0 = sys[cy], b1 = sys[cy + 1];
+        if (a1 <= a0 || b1 <= b0) continue;
+        const ix0 = Math.max(a0, fr.tx), ix1 = Math.min(a1, fr.tx + fr.tw), iy0 = Math.max(b0, fr.ty), iy1 = Math.min(b1, fr.ty + fr.th);
+        if (ix1 <= ix0 || iy1 <= iy0) continue;
+        const mx = (v) => dxs[cx] + (v - a0) * (dxs[cx + 1] - dxs[cx]) / (a1 - a0);
+        const my = (v) => dys[cy] + (v - b0) * (dys[cy + 1] - dys[cy]) / (b1 - b0);
+        drawRegion(fr, fr.sx + (ix0 - fr.tx) * kx, fr.sy + (iy0 - fr.ty) * ky, (ix1 - ix0) * kx, (iy1 - iy0) * ky,
+          mx(ix0) - ox, my(iy0) - oy, mx(ix1) - mx(ix0), my(iy1) - my(iy0), x, y, xs < 0 ? -1 : 1, ys < 0 ? -1 : 1, rot, col, alpha);
+      }
+    }
+  }
 
   D.spriteGeneral = function (spr, sub, left, top, w, h, x, y, xs, ys, rot, cols, alpha) {
     const s = GM.sprites[spr];
@@ -240,6 +269,7 @@
   D.spriteStretched = function (spr, sub, x, y, w, h, col, alpha) {
     const s = GM.sprites[spr];
     if (!s) return;
+    if (s.nine) { const fr = frameOf(s, sub); if (fr) drawNine(s, fr, x + s.ox * w / s.w, y + s.oy * h / s.h, w / s.w, h / s.h, 0, col, alpha); return; }
     D.spriteGeneral(spr, sub, 0, 0, s.w, s.h, x, y, w / s.w, h / s.h, 0, [col, col, col, col], alpha);
   };
 
@@ -443,7 +473,7 @@
     const s = surf(id);
     if (!s) return;
     if (s.fbo === target.fbo) { GM.warnOnce('draw surface onto itself'); return; }
-    if (sw === undefined) { sx = 0; sy = 0; sw = s.w; sh = s.h; }
+    if (sx === undefined || sw === undefined) { sx = 0; sy = 0; sw = s.w; sh = s.h; } // whole surface (draw_surface / _ext)
     const u0 = sx / s.w, u1 = (sx + sw) / s.w, v0 = 1 - sy / s.h, v1 = 1 - (sy + sh) / s.h;
     drawTex(s.tex, u0, v0, u1, v1, 0, 0, sw, sh, x, y, xs, ys, rot, cols, alpha);
   };

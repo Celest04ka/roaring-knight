@@ -580,8 +580,11 @@ GM.gotoRoomNow = function (roomIndex) {
   // room end events
   if (GM.room >= 0) {
     for (const inst of GM.instances.slice()) if (!inst.$dead) GM.perform(inst, EV.OTHER, 5);
-    // remove non-persistent instances (no Destroy event on room change, Clean Up runs)
-    for (const inst of GM.instances) if (!inst.persistent && !inst.$dead) { inst.$dead = true; GM.perform(inst, EV.CLEANUP, 0, inst); }
+    // remove non-persistent instances (no Destroy event on room change, Clean Up runs). All Clean Up events run
+    // before anything is removed: they may still read other leaving instances (obj_knight_pointing_cone -> obj_knight_enemy)
+    const leaving = GM.instances.filter(inst => !inst.persistent && !inst.$dead);
+    for (const inst of leaving) GM.perform(inst, EV.CLEANUP, 0, inst);
+    for (const inst of leaving) inst.$dead = true;
     GM.removeMarked();
   }
   const name = GM.roomNames[roomIndex];
